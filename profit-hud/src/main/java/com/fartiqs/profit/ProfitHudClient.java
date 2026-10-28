@@ -4,31 +4,33 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.font.TextRenderer;
 import net.minecraft.client.gui.DrawContext;
-import net.minecraft.client.network.ServerInfo;
 import net.minecraft.client.render.RenderTickCounter;
+import net.minecraft.scoreboard.Scoreboard;
 import net.minecraft.scoreboard.ScoreboardDisplaySlot;
 import net.minecraft.scoreboard.ScoreboardEntry;
 import net.minecraft.scoreboard.ScoreboardObjective;
-import net.minecraft.scoreboard.Scoreboard;
 import net.minecraft.scoreboard.Team;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
 
 import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class ProfitHudClient implements ClientModInitializer {
 
-    // Distance from the top of the screen. Raise this if it overlaps a bossbar.
     private static final int Y = 4;
 
     private static final int GREEN = 0xFF55FF55;
@@ -36,21 +38,31 @@ public class ProfitHudClient implements ClientModInitializer {
     private static final int GRAY = 0xFFAAAAAA;
     private static final int BG = 0x90000000;
 
-    // Reads the number after the word "Money" on the sidebar, e.g. "$ Money 1.5M"
-    private static final Pattern MONEY = Pattern.compile(
-            "(?i)money[^0-9]*([0-9][0-9,]*(?:\\.[0-9]+)?)(?:\\s*([kmbt])(?![a-z]))?");
+    private static final String NUM = "([0-9][0-9,]*(?:\\.[0-9]+)?)(?:\\s*([kmbt])(?![a-z]))?";
+    private static final Pattern BOARD_MONEY = Pattern.compile("(?i)money[^0-9]*" + NUM);
+    private static final Pattern BOARD_DOLLAR = Pattern.compile("\\$\\s*" + NUM);
+    private static final Pattern PAID_YOU = Pattern.compile("(?i)(\\S+)\\s+paid\\s+you\\s+\\$\\s*" + NUM);
+    private static final Pattern YOU_PAID = Pattern.compile("(?i)you\\s+paid\\s+(\\S+)\\s+\\$\\s*" + NUM);
 
     private static final DecimalFormat FMT = new DecimalFormat("0.##", DecimalFormatSymbols.getInstance(Locale.US));
 
-    private static Double startBalance = null;
-    private static Double currentBalance = null;
-    private static int ticksSinceJoin = 0;
+    // exact profit from /pay messages
+    private static double chatTotal = 0;
+    // chat amounts since the scoreboard last moved (so big payments aren't counted twice)
+    private static double chatSince = 0;
+    // profit from big scoreboard changes (sales, auctions, etc.)
+    private static double boardProfit = 0;
+    private static Double lastBoard = null;
+    private static int ticks = 0;
 
     @Override
     public void onInitializeClient() {
         ClientTickEvents.END_CLIENT_TICK.register(ProfitHudClient::tick);
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> reset());
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> reset());
+        ClientReceiveMessageEvents.GAME.register((message, overlay) -> {
+            if (!overlay) onChat(message.getString());
+        });
 
         HudElementRegistry.attachElementAfter(
                 VanillaHudElements.MISC_OVERLAYS,
@@ -59,61 +71,102 @@ public class ProfitHudClient implements ClientModInitializer {
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
                 dispatcher.register(ClientCommandManager.literal("profitreset").executes(ctx -> {
-                    startBalance = currentBalance;
+                    chatTotal = 0;
+                    chatSince = 0;
+                    boardProfit = 0;
+                    lastBoard = null;
                     ctx.getSource().sendFeedback(Text.literal("Profit tracker reset."));
                     return 1;
                 })));
     }
 
     private static void reset() {
-        startBalance = null;
-        currentBalance = null;
-        ticksSinceJoin = 0;
+        chatTotal = 0;
+        chatSince = 0;
+        boardProfit = 0;
+        lastBoard = null;
+        ticks = 0;
     }
 
-    private static boolean isDonut(MinecraftClient mc) {
-        ServerInfo info = mc.getCurrentServerEntry();
-        return info != null && info.address != null && info.address.toLowerCase(Locale.ROOT).contains("donut");
+    private static double parse(Matcher m, int numGroup) {
+        double v = Double.parseDouble(m.group(numGroup).replace(",", ""));
+        String suf = m.group(numGroup + 1);
+        if (suf != null) {
+            switch (suf.toLowerCase(Locale.ROOT)) {
+                case "k" -> v *= 1e3;
+                case "m" -> v *= 1e6;
+                case "b" -> v *= 1e9;
+                case "t" -> v *= 1e12;
+            }
+        }
+        return v;
     }
 
-    private static void tick(MinecraftClient mc) {
-        if (mc.world == null || mc.player == null || !isDonut(mc)) return;
-        ticksSinceJoin++;
-        if (ticksSinceJoin % 10 != 0) return;
-
-        Double bal = readMoney(mc);
-        if (bal == null) return;
-        currentBalance = bal;
-        // wait ~3s after joining so we don't lock in a not-yet-loaded 0 balance
-        if (startBalance == null && ticksSinceJoin >= 60) {
-            startBalance = bal;
+    private static void onChat(String msg) {
+        try {
+            Matcher m = PAID_YOU.matcher(msg);
+            if (m.find()) {
+                double v = parse(m, 2);
+                chatTotal += v;
+                chatSince += v;
+                return;
+            }
+            m = YOU_PAID.matcher(msg);
+            if (m.find()) {
+                double v = parse(m, 2);
+                chatTotal -= v;
+                chatSince -= v;
+            }
+        } catch (NumberFormatException ignored) {
         }
     }
 
-    private static Double readMoney(MinecraftClient mc) {
+    private static void tick(MinecraftClient mc) {
+        if (mc.world == null || mc.player == null) return;
+        ticks++;
+        if (ticks % 10 != 0) return;
+
+        Double board = readBoardMoney(mc);
+        if (board == null) return;
+
+        if (lastBoard == null) {
+            if (ticks >= 60) lastBoard = board; // wait for scoreboard to load
+            return;
+        }
+
+        // The sidebar rounds (e.g. 8B), so only trust big moves (5%+ of balance)
+        double unexplained = (board - lastBoard) - chatSince;
+        if (Math.abs(unexplained) >= Math.max(1000, lastBoard * 0.05)) {
+            boardProfit += unexplained;
+            lastBoard = board;
+            chatSince = 0;
+        }
+    }
+
+    private static Double readBoardMoney(MinecraftClient mc) {
         Scoreboard sb = mc.world.getScoreboard();
         ScoreboardObjective obj = sb.getObjectiveForSlot(ScoreboardDisplaySlot.SIDEBAR);
         if (obj == null) return null;
 
-        for (ScoreboardEntry e : sb.getScoreboardEntries(obj)) {
+        List<ScoreboardEntry> entries = new ArrayList<>(sb.getScoreboardEntries(obj));
+        entries.sort(Comparator.comparingInt(ScoreboardEntry::value).reversed());
+
+        List<String> lines = new ArrayList<>();
+        for (ScoreboardEntry e : entries) {
             Team team = sb.getScoreHolderTeam(e.owner());
-            String line = Team.decorateName(team, e.name()).getString();
-            Matcher m = MONEY.matcher(line);
-            if (!m.find()) continue;
-            try {
-                double v = Double.parseDouble(m.group(1).replace(",", ""));
-                String suf = m.group(2);
-                if (suf != null) {
-                    switch (suf.toLowerCase(Locale.ROOT)) {
-                        case "k" -> v *= 1e3;
-                        case "m" -> v *= 1e6;
-                        case "b" -> v *= 1e9;
-                        case "t" -> v *= 1e12;
-                    }
-                }
-                return v;
-            } catch (NumberFormatException ignored) {
+            lines.add(Team.decorateName(team, e.name()).getString());
+        }
+
+        try {
+            for (String line : lines) {
+                Matcher m = BOARD_MONEY.matcher(line);
+                if (m.find()) return parse(m, 1);
             }
+            for (String line : lines) {
+                Matcher m = BOARD_DOLLAR.matcher(line);
+                if (m.find()) return parse(m, 1);
+            }
+        } catch (NumberFormatException ignored) {
         }
         return null;
     }
@@ -129,12 +182,11 @@ public class ProfitHudClient implements ClientModInitializer {
 
     private static void render(DrawContext ctx, RenderTickCounter tickCounter) {
         MinecraftClient mc = MinecraftClient.getInstance();
-        if (mc.options.hudHidden || mc.world == null || !isDonut(mc)) return;
-        if (startBalance == null || currentBalance == null) return;
+        if (mc.options.hudHidden || mc.world == null) return;
 
-        double profit = currentBalance - startBalance;
-        boolean up = profit > 0;
-        boolean down = profit < 0;
+        double profit = chatTotal + boardProfit;
+        boolean up = profit > 0.0001;
+        boolean down = profit < -0.0001;
         int color = up ? GREEN : (down ? RED : GRAY);
 
         String text = formatMoney(profit);
