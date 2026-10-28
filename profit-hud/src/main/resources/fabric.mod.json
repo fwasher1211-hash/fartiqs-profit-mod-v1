@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "fartiqsprofit",
+  "version": "${version}",
+  "name": "Fartiqs Profit HUD",
+  "description": "Shows your session profit at the top of the screen on DonutSMP, with a green up arrow or red down arrow.",
+  "authors": ["Fartiqs"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.fartiqs.profit.ProfitHudClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.1",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
