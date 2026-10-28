@@ -18,6 +18,7 @@ import net.minecraft.scoreboard.ScoreboardEntry;
 import net.minecraft.scoreboard.ScoreboardObjective;
 import net.minecraft.scoreboard.Team;
 import net.minecraft.text.Text;
+import net.minecraft.util.Formatting;
 import net.minecraft.util.Identifier;
 
 import java.text.DecimalFormat;
@@ -31,12 +32,16 @@ import java.util.regex.Pattern;
 
 public class ProfitHudClient implements ClientModInitializer {
 
-    private static final int Y = 4;
+    // Distance from the top of the screen
+    private static final int Y = 6;
 
-    private static final int GREEN = 0xFF55FF55;
-    private static final int RED = 0xFFFF5555;
+    // Neon look
+    private static final int NEON_RED = 0xFFFF2040;
+    private static final int NEON_GREEN = 0xFF39FF14;
     private static final int GRAY = 0xFFAAAAAA;
-    private static final int BG = 0x90000000;
+    private static final int BLUE = 0xFF2F80FF;
+    private static final int LIVE_TEXT = 0xFFE6F0FF;
+    private static final int PILL_BG = 0xF0060B2A;
 
     private static final String NUM = "([0-9][0-9,]*(?:\\.[0-9]+)?)(?:\\s*([kmbt])(?![a-z]))?";
     private static final Pattern BOARD_MONEY = Pattern.compile("(?i)money[^0-9]*" + NUM);
@@ -46,11 +51,8 @@ public class ProfitHudClient implements ClientModInitializer {
 
     private static final DecimalFormat FMT = new DecimalFormat("0.##", DecimalFormatSymbols.getInstance(Locale.US));
 
-    // exact profit from /pay messages
     private static double chatTotal = 0;
-    // chat amounts since the scoreboard last moved (so big payments aren't counted twice)
     private static double chatSince = 0;
-    // profit from big scoreboard changes (sales, auctions, etc.)
     private static double boardProfit = 0;
     private static Double lastBoard = null;
     private static int ticks = 0;
@@ -71,10 +73,7 @@ public class ProfitHudClient implements ClientModInitializer {
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
                 dispatcher.register(ClientCommandManager.literal("profitreset").executes(ctx -> {
-                    chatTotal = 0;
-                    chatSince = 0;
-                    boardProfit = 0;
-                    lastBoard = null;
+                    reset();
                     ctx.getSource().sendFeedback(Text.literal("Profit tracker reset."));
                     return 1;
                 })));
@@ -130,11 +129,10 @@ public class ProfitHudClient implements ClientModInitializer {
         if (board == null) return;
 
         if (lastBoard == null) {
-            if (ticks >= 60) lastBoard = board; // wait for scoreboard to load
+            if (ticks >= 60) lastBoard = board;
             return;
         }
 
-        // The sidebar rounds (e.g. 8B), so only trust big moves (5%+ of balance)
         double unexplained = (board - lastBoard) - chatSince;
         if (Math.abs(unexplained) >= Math.max(1000, lastBoard * 0.05)) {
             boardProfit += unexplained;
@@ -180,6 +178,17 @@ public class ProfitHudClient implements ClientModInitializer {
         return "$" + FMT.format(a);
     }
 
+    // rounded rectangle (2px corners)
+    private static void roundRect(DrawContext ctx, int x1, int y1, int x2, int y2, int color) {
+        ctx.fill(x1 + 2, y1, x2 - 2, y2, color);
+        ctx.fill(x1 + 1, y1 + 1, x2 - 1, y2 - 1, color);
+        ctx.fill(x1, y1 + 2, x2, y2 - 2, color);
+    }
+
+    private static int withAlpha(int rgb, int alpha) {
+        return (alpha << 24) | (rgb & 0xFFFFFF);
+    }
+
     private static void render(DrawContext ctx, RenderTickCounter tickCounter) {
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc.options.hudHidden || mc.world == null) return;
@@ -187,30 +196,64 @@ public class ProfitHudClient implements ClientModInitializer {
         double profit = chatTotal + boardProfit;
         boolean up = profit > 0.0001;
         boolean down = profit < -0.0001;
-        int color = up ? GREEN : (down ? RED : GRAY);
+        int color = up ? NEON_GREEN : (down ? NEON_RED : GRAY);
 
-        String text = formatMoney(profit);
+        String amount = (down ? "-" : (up ? "+" : "")) + formatMoney(profit);
+
         TextRenderer tr = mc.textRenderer;
-        int textW = tr.getWidth(text);
+        Text liveText = Text.literal("Live").formatted(Formatting.BOLD);
+        Text amountText = Text.literal(amount).formatted(Formatting.BOLD);
+
+        int liveW = tr.getWidth(liveText);
+        int pipeW = tr.getWidth("|");
+        int amountW = tr.getWidth(amountText);
         int arrowW = (up || down) ? 9 : 0;
-        int gap = arrowW > 0 ? 4 : 0;
-        int total = arrowW + gap + textW;
+        int arrowGap = arrowW > 0 ? 4 : 0;
+        int gap = 5;
 
-        int x = (mc.getWindow().getScaledWidth() - total) / 2;
-        int y = Y;
+        int contentW = liveW + gap + pipeW + gap + arrowW + arrowGap + amountW;
+        int padX = 9;
+        int padY = 5;
+        int w = contentW + padX * 2;
+        int h = 9 + padY * 2;
 
-        ctx.fill(x - 5, y - 3, x + total + 5, y + 11, BG);
+        int x0 = (mc.getWindow().getScaledWidth() - w) / 2;
+        int y0 = Y;
+        int x1 = x0 + w;
+        int y1 = y0 + h;
+
+        // blue neon glow, border, background
+        roundRect(ctx, x0 - 3, y0 - 3, x1 + 3, y1 + 3, withAlpha(BLUE, 0x18));
+        roundRect(ctx, x0 - 2, y0 - 2, x1 + 2, y1 + 2, withAlpha(BLUE, 0x30));
+        roundRect(ctx, x0 - 1, y0 - 1, x1 + 1, y1 + 1, withAlpha(BLUE, 0x60));
+        roundRect(ctx, x0, y0, x1, y1, BLUE);
+        roundRect(ctx, x0 + 1, y0 + 1, x1 - 1, y1 - 1, PILL_BG);
+
+        int tx = x0 + padX;
+        int ty = y0 + padY;
+
+        ctx.drawText(tr, liveText, tx, ty, LIVE_TEXT, true);
+        tx += liveW + gap;
+        ctx.drawText(tr, "|", tx, ty, BLUE, false);
+        tx += pipeW + gap;
 
         if (up) {
             for (int i = 0; i < 5; i++) {
-                ctx.fill(x + 4 - i, y + 2 + i, x + 5 + i, y + 3 + i, color);
+                ctx.fill(tx + 4 - i, ty + 2 + i, tx + 5 + i, ty + 3 + i, color);
             }
         } else if (down) {
             for (int i = 0; i < 5; i++) {
-                ctx.fill(x + i, y + 2 + i, x + 9 - i, y + 3 + i, color);
+                ctx.fill(tx + i, ty + 2 + i, tx + 9 - i, ty + 3 + i, color);
             }
         }
+        tx += arrowW + arrowGap;
 
-        ctx.drawText(tr, text, x + arrowW + gap, y, color, true);
+        // neon glow behind the amount, then the amount itself
+        int glow = withAlpha(color, 0x40);
+        ctx.drawText(tr, amountText, tx - 1, ty, glow, false);
+        ctx.drawText(tr, amountText, tx + 1, ty, glow, false);
+        ctx.drawText(tr, amountText, tx, ty - 1, glow, false);
+        ctx.drawText(tr, amountText, tx, ty + 1, glow, false);
+        ctx.drawText(tr, amountText, tx, ty, color, true);
     }
 }
